@@ -1,0 +1,985 @@
+--- a/cmd/quasar-bridge/config.go
++++ b/cmd/quasar-bridge/config.go
+@@ -1,3 +1,4 @@
++// Modified for Alice Gemini Bridge: native acknowledgement, persona and microphone control fixes.
+ package main
+ 
+ import (
+@@ -24,6 +25,11 @@
+ }
+ 
+ type config struct {
++	SystemPrompt string `json:"system_prompt"`
++	VoiceCues    struct {
++		Enabled  bool   `json:"enabled"`
++		CacheDir string `json:"cache_dir"`
++	} `json:"voice_cues"`
+ 	DialogueContext    dialogue.Config      `json:"dialogue_context"`
+ 	LocalProgress      progressConfig       `json:"local_progress"`
+ 	AssistantTools     assistant.Config     `json:"assistant_tools"`
+@@ -161,6 +167,12 @@
+ 	if cfg.LocalProgress.AfterMS < 100 || cfg.LocalProgress.AfterMS > 10000 || cfg.LocalProgress.IntervalMS < 1000 || cfg.LocalProgress.IntervalMS > 10000 {
+ 		return cfg, errors.New("invalid local_progress timing")
+ 	}
++	if len(cfg.SystemPrompt) > 12000 {
++		return cfg, errors.New("system_prompt too long")
++	}
++	if cfg.VoiceCues.Enabled && cfg.VoiceCues.CacheDir == "" {
++		return cfg, errors.New("voice_cues requires cache_dir")
++	}
+ 	if err := cfg.DialogueContext.Validate(); err != nil {
+ 		return cfg, err
+ 	}
+--- a/cmd/quasar-bridge/config_test.go
++++ b/cmd/quasar-bridge/config_test.go
+@@ -1,3 +1,4 @@
++// Modified for Alice Gemini Bridge: native acknowledgement, persona and microphone control fixes.
+ package main
+ 
+ import (
+@@ -9,6 +10,15 @@
+ 
+ 	"quasarbridge/internal/bridge"
+ )
++
++func TestRemovedListeningLimitIsRejected(t *testing.T) {
++	if _, err := readConfig(configFile(t, `{"voice_cues":{"enabled":true,"cache_dir":"cues","listen_limit_ms":10000}}`)); err == nil {
++		t.Fatal("removed interruption setting accepted")
++	}
++	if _, err := readConfig(configFile(t, `{"voice_cues":{"enabled":true,"cache_dir":"cues"}}`)); err != nil {
++		t.Fatal("thinking cue should not require an interruption timer", err)
++	}
++}
+ 
+ func TestReadConfigLLMAPISettings(t *testing.T) {
+ 	for _, tc := range []struct {
+--- a/cmd/quasar-bridge/main.go
++++ b/cmd/quasar-bridge/main.go
+@@ -1,3 +1,4 @@
++// Modified for Alice Gemini Bridge: native acknowledgement, persona and microphone control fixes.
+ package main
+ 
+ import (
+@@ -144,7 +145,7 @@
+ 		MaxOutputTokens: cfg.LLMMaxOutputTokens, HostedTools: cfg.LLMHostedTools,
+ 		ChatParameters: cfg.LLMChatParameters,
+ 	}
+-	engine := &bridge.Engine{LLM: lc, Dialogue: dialogue.New(cfg.DialogueContext)}
++	engine := &bridge.Engine{LLM: lc, Dialogue: dialogue.New(cfg.DialogueContext), SystemPrompt: cfg.SystemPrompt}
+ 	var musicQueue *assistant.MusicQueue
+ 	var hc *home.Controller
+ 	if endpoint := os.Getenv("QUASAR_HOME_MCP_URL"); endpoint != "" {
+@@ -226,6 +227,14 @@
+ 	}
+ 	defer logs.Close()
+ 	proxy.Journal = logs
++	var cues *bridge.VoiceCues
++	if cfg.VoiceCues.Enabled {
++		cues, err = bridge.OpenVoiceCues(cfg.VoiceCues.CacheDir)
++		if err != nil {
++			slog.Error("native cue cache rejected")
++			os.Exit(1)
++		}
++	}
+ 	if cfg.Mode == "hybrid" {
+ 		if hc != nil && cfg.HomeWarmArea != "" {
+ 			warmCtx, warmCancel := context.WithCancel(context.Background())
+@@ -247,6 +256,8 @@
+ 
+ 		proxy.NewSession = func(ctx context.Context, up, down bridge.Sender) bridge.Session {
+ 			n := bridge.NewNative(ctx, up, down, engine)
++			n.VoiceCues = cues
++
+ 			n.GateText = false
+ 			n.ShouldListen = cfg.ListenAfterReply
+ 			if cfg.LocalProgress.Enabled {
+--- a/internal/bridge/engine.go
++++ b/internal/bridge/engine.go
+@@ -1,3 +1,4 @@
++// Modified for Alice Gemini Bridge: native acknowledgement, persona and microphone control fixes.
+ package bridge
+ 
+ import (
+@@ -30,6 +31,7 @@
+ 	StartMusic(context.Context, string) (string, error)
+ }
+ type Engine struct {
++	SystemPrompt string
+ 	LLM          Completer
+ 	Assistant    Completer
+ 	Home         HomeHandler
+@@ -148,6 +150,9 @@
+ 	messages = append(messages, snapshot.Messages...)
+ 	messages = append(messages, llm.Message{Role: "user", Content: text})
+ 	private := snapshot.PrivateHistory
++	if e.SystemPrompt != "" {
++		messages[0].Content += "\n" + e.SystemPrompt
++	}
+ 	var answer string
+ 	var err error
+ 	if contextual, ok := answerer.(interface {
+--- a/internal/bridge/native.go
++++ b/internal/bridge/native.go
+@@ -1,3 +1,4 @@
++// Modified for Alice Gemini Bridge: native acknowledgement, persona and microphone control fixes.
+ package bridge
+ 
+ import (
+@@ -44,6 +45,9 @@
+ }
+ 
+ type nativeRequest struct {
++	speaker                         string
++	cacheText                       string
++	cacheAudio                      []byte
+ 	streaming                       bool
+ 	listenOnStreamStart             bool
+ 	partial                         uint32
+@@ -76,6 +80,7 @@
+ 	expires                         *time.Timer
+ }
+ type Native struct {
++	VoiceCues        *VoiceCues
+ 	connectionScope  string
+ 	ctx              context.Context
+ 	cancel           context.CancelFunc
+@@ -83,6 +88,7 @@
+ 	resolver         Resolver
+ 	mu               sync.Mutex
+ 	requests         map[string]*nativeRequest
++	microphones      map[uint32]*nativeRequest
+ 	tts              map[string]*nativeRequest
+ 	streams          map[uint32]*nativeRequest
+ 	blocked          map[uint32]*nativeRequest
+@@ -97,7 +103,7 @@
+ 
+ func NewNative(ctx context.Context, up, down Sender, resolver Resolver) *Native {
+ 	ctx, cancel := context.WithCancel(ctx)
+-	return &Native{connectionScope: newID(), ctx: ctx, cancel: cancel, up: up, down: down, resolver: resolver, ShouldListen: true, requests: map[string]*nativeRequest{}, tts: map[string]*nativeRequest{}, streams: map[uint32]*nativeRequest{}, blocked: map[uint32]*nativeRequest{}}
++	return &Native{connectionScope: newID(), ctx: ctx, cancel: cancel, up: up, down: down, resolver: resolver, ShouldListen: true, requests: map[string]*nativeRequest{}, microphones: map[uint32]*nativeRequest{}, tts: map[string]*nativeRequest{}, streams: map[uint32]*nativeRequest{}, blocked: map[uint32]*nativeRequest{}}
+ }
+ func (n *Native) Close() {
+ 	n.cancel()
+@@ -112,6 +118,9 @@
+ }
+ func (n *Native) Client(ctx context.Context, k websocket.MessageType, data []byte) error {
+ 	f := wire.Decode(data, wire.ClientToServer)
++	if n.VoiceCues != nil && n.micFrame(f, data) {
++		return nil
++	}
+ 	if f.Client == nil || f.Client.GetEvent() == nil {
+ 		return n.up(ctx, k, data)
+ 	}
+@@ -163,6 +172,7 @@
+ 			return n.queueSound(ctx, p, request)
+ 		})
+ 		p.header = proto.Clone(e.GetHeader()).(*header.TEventHeader)
++		p.speaker = scope
+ 		p.isText = f.Kind() == "TextInput"
+ 		p.input = append([]byte{}, data...)
+ 		p.gated = !p.isText || n.GateText
+@@ -190,6 +200,9 @@
+ 			p.canceled = true
+ 			p.cancel()
+ 			delete(n.requests, p.id)
++			if n.microphones[uint32(p.header.GetStreamId())] == p {
++				delete(n.microphones, uint32(p.header.GetStreamId()))
++			}
+ 			delete(n.tts, p.ttsID)
+ 			delete(n.tts, p.progressTTS)
+ 			for stream, q := range n.blocked {
+@@ -204,6 +217,8 @@
+ 			}
+ 		})
+ 		n.requests[id] = p
++		n.supersedeLocked(p)
++		n.registerMicrophoneLocked(p)
+ 		n.mu.Unlock()
+ 		if p.gated {
+ 			gated, err := wire.EnableApproval(f)
+@@ -280,6 +295,14 @@
+ 		if len(data) >= 4 {
+ 			n.mu.Lock()
+ 			p := n.streams[binary.BigEndian.Uint32(data)]
++			if p != nil && p.cacheText != "" && !p.canceled {
++				if len(p.cacheAudio)+len(data)-4 <= cueLimit {
++					p.cacheAudio = append(p.cacheAudio, data[4:]...)
++				} else {
++					p.cacheText = ""
++					p.cacheAudio = nil
++				}
++			}
+ 			drop := n.blocked[binary.BigEndian.Uint32(data)] != nil || (p != nil && p.canceled)
+ 			if p != nil && p.streaming && !drop {
+ 				out, err := p.audio.feed(data[4:])
+@@ -301,6 +324,10 @@
+ 	}
+ 	if sc := f.Server.GetStreamControl(); sc != nil {
+ 		n.mu.Lock()
++		if sc.GetClose() != nil && n.staleMicControlLocked(sc) {
++			n.mu.Unlock()
++			return nil
++		}
+ 		if n.blocked[uint32(sc.GetStreamId())] != nil {
+ 			delete(n.blocked, uint32(sc.GetStreamId()))
+ 			n.mu.Unlock()
+@@ -318,6 +345,15 @@
+ 			if p.canceled {
+ 				n.mu.Unlock()
+ 				return nil
++			}
++			if sc.GetClose() != nil && p.cacheText != "" && n.VoiceCues != nil {
++				if sc.GetClose().GetReason() == 0 {
++					if err := n.VoiceCues.save(p.cacheText, p.cacheAudio); err != nil {
++						slog.Warn("native_cue_save_failed")
++					}
++				}
++				p.cacheText = ""
++				p.cacheAudio = nil
+ 			}
+ 			if p.streaming && sc.GetClose() != nil {
+ 				if err := p.audio.endSource(); err != nil {
+@@ -387,6 +423,9 @@
+ 	}
+ 	if isTTS {
+ 		if p.canceled {
++			if e.GetTtsSpeak() != nil {
++				n.blocked[uint32(e.GetHeader().GetStreamId())] = p
++			}
+ 			n.mu.Unlock()
+ 			return nil
+ 		}
+@@ -405,7 +444,7 @@
+ 				}
+ 				p.audioIsProgress = p.ttsID == p.progressTTS
+ 				p.audio.next()
+-				p.audio.source.discardAudio = p.audioIsProgress
++				p.audio.source.discardAudio = p.audioIsProgress && n.VoiceCues == nil
+ 				if p.audioStarted {
+ 					p.audioWaiting = false
+ 					n.mu.Unlock()
+@@ -512,6 +551,10 @@
+ }
+ func (n *Native) maybeResolve(p *nativeRequest) {
+ 	n.mu.Lock()
++	if n.VoiceCues != nil && !p.isText && !p.final {
++		n.mu.Unlock()
++		return
++	}
+ 	if p.started || p.canceled || (strings.TrimSpace(p.text) == "" && !p.final) {
+ 		n.mu.Unlock()
+ 		return
+@@ -537,7 +580,7 @@
+ 				n.mu.Unlock()
+ 				slog.Info("native_route_decision", "request", requestTag(p.id), "route", decision.Route, "source", decision.Source)
+ 				stop := func() {}
+-				if decision.Route != "yandex" && n.ProgressAfter > 0 {
++				if decision.Route != "yandex" && (n.ProgressAfter > 0 || n.VoiceCues != nil) && decision.Source != "dialogue_reset" {
+ 					stop = n.progress(p)
+ 				}
+ 				result, err = routed.ResolveDecision(p.ctx, text, decision)
+@@ -655,6 +698,15 @@
+ 	return n.synthesize(p, text)
+ }
+ func (n *Native) synthesize(p *nativeRequest, text string) error {
++	if cached := n.VoiceCues.load(text); len(cached) > 0 {
++		return n.replayCue(p, cached)
++	}
++	if n.VoiceCues != nil && cueFile(text) != "" {
++		n.mu.Lock()
++		p.cacheText = text
++		p.cacheAudio = nil
++		n.mu.Unlock()
++	}
+ 	t := &client.TClientMessage{Message: &client.TClientMessage_Event{Event: &client.TClientMessage_TEvent{Header: &header.TEventHeader{MessageId: p.ttsID}, Event: &client.TClientMessage_TEvent_TtsGenerate{TtsGenerate: &tts.TTtsGenerate{Text: new(text), Lang: new("ru-RU"), Format: new("audio/opus")}}}}}
+ 	b, err := (wire.Frame{Client: t, Prefix: []byte("AAPI")}).Marshal()
+ 	if err != nil {
+--- a/internal/bridge/progress.go
++++ b/internal/bridge/progress.go
+@@ -1,3 +1,4 @@
++// Modified for Alice Gemini Bridge: native acknowledgement, persona and microphone control fixes.
+ package bridge
+ 
+ import (
+@@ -21,42 +22,27 @@
+ func (n *Native) progress(p *nativeRequest) func() {
+ 	stop := make(chan struct{})
+ 	done := make(chan struct{})
++	ready := make(chan struct{})
+ 	n.wg.Go(func() {
+ 		defer close(done)
+-		timer := time.NewTimer(n.ProgressAfter)
++		delay := n.ProgressAfter
++		if n.VoiceCues != nil {
++			delay = 0
++		}
++		timer := time.NewTimer(delay)
+ 		defer timer.Stop()
+ 		select {
+ 		case <-stop:
++			close(ready)
+ 			return
+ 		case <-p.ctx.Done():
++			close(ready)
+ 			return
+ 		case <-timer.C:
+ 		}
+-		n.mu.Lock()
+-		if p.canceled || p.ctx.Err() != nil {
+-			n.mu.Unlock()
+-			return
+-		}
+-		p.local = true
+-		p.streaming = true
+-		p.responseID = newID()
+-		p.ttsID = newID()
+-		p.progressTTS = p.ttsID
+-		p.progressAudioDone = make(chan struct{})
+-		n.tts[p.ttsID] = p
+-		n.mu.Unlock()
+-		if p.gated {
+-			if n.sendCancel(p.ctx, p.id) != nil {
+-				p.cancel()
+-				return
+-			}
+-		} else {
+-			if n.ack(p) != nil {
+-				p.cancel()
+-				return
+-			}
+-		}
+-		if n.beginDeferred(p) != nil {
++		err := n.startProgress(p)
++		close(ready)
++		if err != nil {
+ 			p.cancel()
+ 			return
+ 		}
+@@ -81,6 +67,9 @@
+ 			}
+ 		}
+ 	})
++	if n.VoiceCues != nil {
++		<-ready
++	}
+ 	return func() { close(stop); <-done }
+ }
+ func (p *nativeRequest) applicationID() string {
+@@ -106,6 +95,9 @@
+ 		return err
+ 	}
+ 	// Obtain the provider's actual Opus headers; its speech payload is discarded.
++	if n.VoiceCues != nil {
++		return n.synthesize(p, ThinkingPhrase)
++	}
+ 	return n.synthesize(p, "а")
+ }
+ func (n *Native) deferredPart(p *nativeRequest, text string, last bool) error {
+--- a/internal/bridge/safety.go
++++ b/internal/bridge/safety.go
+@@ -1,8 +1,12 @@
++// Modified for Alice Gemini Bridge: restore fail-closed retry eligibility checks.
+ package bridge
+ 
+ import (
+ 	"context"
+-	
++	"encoding/json/v2"
++	"errors"
++	"strings"
++	"time"
+ 
+ 	"quasarbridge/internal/llm"
+ )
+@@ -21,12 +25,9 @@
+ // Errors, missing configuration, uncertain or malformed decisions fail closed.
+ // It never executes tools or depends on a dialogue session or request ticket.
+ func (e *Engine) CheckQuestionSafety(ctx context.Context, input QuestionSafetyInput) (bool, error) {
+-	//var eligibility struct {
+-	//	Safe *bool `json:"safe"`
+-	//}
+-
+-	return true, nil
+-/*
++	var eligibility struct {
++		Safe *bool `json:"safe"`
++	}
+ 	if err := ctx.Err(); err != nil {
+ 		return false, err
+ 	}
+@@ -53,10 +54,8 @@
+ 	if err != nil {
+ 		return false, err
+ 	}
+-	
+ 	if len(guard) > 4096 || json.Unmarshal([]byte(guard), &eligibility, json.RejectUnknownMembers(true)) != nil || eligibility.Safe == nil {
+ 		return false, errors.New("invalid question safety decision")
+ 	}
+ 	return *eligibility.Safe, nil
+-	*/
+ }
+--- a/internal/wire/wire.go
++++ b/internal/wire/wire.go
+@@ -1,3 +1,4 @@
++// Modified for Alice Gemini Bridge: native acknowledgement, persona and microphone control fixes.
+ package wire
+ 
+ import (
+@@ -44,7 +45,7 @@
+ 				f.Client = &m
+ 				return f
+ 			}
+-			if sc := m.GetStreamControl(); sc != nil && sc.GetMessageId() != "" {
++			if sc := m.GetStreamControl(); sc != nil && (sc.GetMessageId() != "" || sc.GetClose() != nil && sc.GetStreamId() != 0) {
+ 				f.Client = &m
+ 				return f
+ 			}
+--- /dev/null
++++ b/internal/bridge/cues.go
+@@ -0,0 +1,229 @@
++// Modified for Alice Gemini Bridge: native acknowledgement, persona and microphone control fixes.
++package bridge
++
++import (
++	"context"
++	"encoding/binary"
++	"errors"
++	"io"
++	"log/slog"
++	"os"
++	"path/filepath"
++	"sync"
++	"sync/atomic"
++
++	"github.com/coder/websocket"
++	header "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/common/event_header"
++	stream "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/stream_control"
++	tts "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/tts_speak"
++	server "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/server"
++	"quasarbridge/internal/wire"
++)
++
++const ThinkingPhrase = "Думаю"
++const cueLimit = 512 << 10
++
++var cueStreams atomic.Uint32
++
++// Only the acknowledgement is persisted, never human speech.
++type VoiceCues struct {
++	mu    sync.Mutex
++	dir   string
++	audio map[string][]byte
++}
++
++func cueFile(text string) string {
++	switch text {
++	case ThinkingPhrase:
++		return "thinking.ogg"
++
++	}
++	return ""
++}
++func OpenVoiceCues(dir string) (*VoiceCues, error) {
++	if dir == "" {
++		return nil, errors.New("voice cue cache directory required")
++	}
++	if err := os.MkdirAll(dir, 0700); err != nil {
++		return nil, err
++	}
++	c := &VoiceCues{dir: dir, audio: map[string][]byte{}}
++	for _, text := range []string{ThinkingPhrase} {
++		f, err := os.Open(filepath.Join(dir, cueFile(text)))
++		if os.IsNotExist(err) {
++			continue
++		}
++		if err != nil {
++			return nil, err
++		}
++		b, err := io.ReadAll(io.LimitReader(f, cueLimit+1))
++		f.Close()
++		if err != nil {
++			return nil, err
++		}
++		if err = validateCue(b); err != nil {
++			return nil, errors.New("invalid saved native cue")
++		}
++		c.audio[text] = b
++	}
++	return c, nil
++}
++func validateCue(b []byte) error {
++	if len(b) == 0 || len(b) > cueLimit {
++		return errors.New("invalid native cue size")
++	}
++	var o oggSpeech
++	if _, err := o.feed(b); err != nil {
++		return err
++	}
++	return o.endSource()
++}
++func (c *VoiceCues) load(text string) []byte {
++	if c == nil {
++		return nil
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.audio[text]
++}
++func (c *VoiceCues) save(text string, b []byte) error {
++	name := cueFile(text)
++	if name == "" {
++		return errors.New("not a static cue")
++	}
++	if err := validateCue(b); err != nil {
++		return err
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if len(c.audio[text]) > 0 {
++		return nil
++	}
++	f, err := os.CreateTemp(c.dir, ".cue-")
++	if err != nil {
++		return err
++	}
++	defer os.Remove(f.Name())
++	if _, err = f.Write(b); err != nil {
++		f.Close()
++		return err
++	}
++	if err = f.Close(); err != nil {
++		return err
++	}
++	if err = os.Rename(f.Name(), filepath.Join(c.dir, name)); err != nil {
++		return err
++	}
++	c.audio[text] = append([]byte(nil), b...)
++	slog.Info("native_cue_saved", "cue", name, "bytes", len(b))
++	return nil
++}
++func (n *Native) replayCue(p *nativeRequest, b []byte) error {
++	// High positive IDs avoid the small cloud/input stream range; still check live IDs.
++	n.mu.Lock()
++	var id uint32
++	for {
++		id = 0x60000000 | (cueStreams.Add(1) & 0x0fffffff)
++		if n.streams[id] == nil && n.blocked[id] == nil && id != uint32(p.header.GetStreamId()) {
++			break
++		}
++	}
++	ttsID := p.ttsID
++	n.mu.Unlock()
++	m := &server.TServerMessage{Message: &server.TServerMessage_Event{Event: &server.TServerMessage_TEvent{Header: &header.TEventHeader{MessageId: newID(), RefMessageId: ttsID, StreamId: new(int64(id))}, Event: &server.TServerMessage_TEvent_TtsSpeak{TtsSpeak: &tts.TTtsSpeak{Format: "audio/opus"}}}}}
++	raw, err := (wire.Frame{Server: m, Prefix: []byte("AAPI")}).Marshal()
++	if err != nil {
++		return err
++	}
++	if err = n.Server(p.ctx, websocket.MessageBinary, raw); err != nil {
++		return err
++	}
++	for len(b) > 0 {
++		count := min(len(b), 16384)
++		if err = n.Server(p.ctx, websocket.MessageBinary, append(binary.BigEndian.AppendUint32(nil, id), b[:count]...)); err != nil {
++			return err
++		}
++		b = b[count:]
++	}
++	m = &server.TServerMessage{Message: &server.TServerMessage_StreamControl{StreamControl: &stream.TStreamControl{MessageId: ttsID, StreamId: int64(id), Action: &stream.TStreamControl_Close{Close: &stream.TStreamControl_TActionClose{}}}}}
++	raw, err = (wire.Frame{Server: m, Prefix: []byte("AAPI")}).Marshal()
++	if err != nil {
++		return err
++	}
++	slog.Info("native_cue_replayed", "request", requestTag(p.id))
++	return n.Server(p.ctx, websocket.MessageBinary, raw)
++}
++
++func (n *Native) micFrame(f wire.Frame, data []byte) bool {
++	n.mu.Lock()
++	defer n.mu.Unlock()
++	if sc := f.Client.GetStreamControl(); sc != nil {
++		if p := n.microphones[uint32(sc.GetStreamId())]; p != nil {
++			blocked := n.staleMicControlLocked(sc) || p.canceled
++			action := "other"
++			if sc.GetSpotterEnd() != nil {
++				action = "spotter_end"
++			} else if sc.GetClose() != nil {
++				action = "close"
++			}
++			slog.Info("native_mic_control", "request", requestTag(p.id), "action", action, "id_matches_request", sc.GetMessageId() == p.id, "id_is_known_request", n.requests[sc.GetMessageId()] != nil, "forwarded", !blocked)
++			return blocked
++		}
++	} else if f.Client == nil && len(data) >= 4 {
++		if p := n.microphones[binary.BigEndian.Uint32(data)]; p != nil {
++			return p.canceled
++		}
++	}
++	return false
++}
++
++// StreamControl can carry its own message ID. Suppress only a known stale
++// request on a reused microphone stream, not an unfamiliar control ID.
++func (n *Native) staleMicControlLocked(sc *stream.TStreamControl) bool {
++	owner := n.microphones[uint32(sc.GetStreamId())]
++	old := n.requests[sc.GetMessageId()]
++	return owner != nil && old != nil && old != owner && old.canceled &&
++		!old.isText && old.header.StreamId != nil && old.header.GetStreamId() == sc.GetStreamId()
++}
++
++// Used before a new owner starts; correlation entries stay to block late responses.
++func (n *Native) supersedeLocked(p *nativeRequest) {
++	if n.VoiceCues == nil {
++		return
++	}
++	for _, old := range n.requests {
++		if old != p && old.speaker == p.speaker && !old.canceled {
++			old.canceled = true
++			old.cancel()
++		}
++	}
++}
++func (n *Native) registerMicrophoneLocked(p *nativeRequest) {
++	if n.VoiceCues != nil && !p.isText && p.header.StreamId != nil {
++		n.microphones[uint32(p.header.GetStreamId())] = p
++	}
++}
++
++func (n *Native) startProgress(p *nativeRequest) error {
++	n.mu.Lock()
++	if p.canceled || p.ctx.Err() != nil {
++		n.mu.Unlock()
++		return context.Canceled
++	}
++	p.local = true
++	p.streaming = true
++	p.responseID = newID()
++	p.ttsID = newID()
++	p.progressTTS = p.ttsID
++	p.progressAudioDone = make(chan struct{})
++	n.tts[p.ttsID] = p
++	n.mu.Unlock()
++	if p.gated {
++		if err := n.sendCancel(p.ctx, p.id); err != nil {
++			return err
++		}
++	} else if err := n.ack(p); err != nil {
++		return err
++	}
++	return n.beginDeferred(p)
++}
+--- /dev/null
++++ b/internal/bridge/cues_test.go
+@@ -0,0 +1,253 @@
++// Modified for Alice Gemini Bridge: native acknowledgement, persona and microphone control fixes.
++package bridge
++
++import (
++	"bytes"
++	"context"
++	"encoding/binary"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/coder/websocket"
++	stream "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/stream_control"
++	client "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/client"
++	server "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/server"
++	"quasarbridge/internal/llm"
++	"quasarbridge/internal/wire"
++)
++
++func cuesForTest(t *testing.T) *VoiceCues {
++	t.Helper()
++	c, err := OpenVoiceCues(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := c.save(ThinkingPhrase, speechFixture(123)); err != nil {
++		t.Fatal(err)
++	}
++	return c
++}
++func micInput(id string, streamID int64) []byte {
++	m := wire.Decode(soundInput(""), wire.ClientToServer).Client
++	e := m.GetEvent()
++	e.Header.MessageId = id
++	e.Header.StreamId = new(streamID)
++	e.GetTextInput().GetRequest().GetEvent().Text = new("")
++	e.Event = &client.TClientMessage_TEvent_VoiceInput{VoiceInput: e.GetTextInput()}
++	return aa(m)
++}
++func micClose(id string, streamID int64) []byte {
++	return aa(&client.TClientMessage{Message: &client.TClientMessage_StreamControl{StreamControl: &stream.TStreamControl{MessageId: id, StreamId: streamID, Action: &stream.TStreamControl_Close{Close: &stream.TStreamControl_TActionClose{}}}}})
++}
++func TestRemovedEasterEggCacheIsIgnored(t *testing.T) {
++	dir := t.TempDir()
++	if err := os.WriteFile(filepath.Join(dir, "cutoff.ogg"), speechFixture(77), 0600); err != nil {
++		t.Fatal(err)
++	}
++	c, err := OpenVoiceCues(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	removed := "Долго еще пиздеть будешь?"
++	if len(c.load(removed)) != 0 {
++		t.Fatal("removed easter egg loaded from disk")
++	}
++	if c.save(removed, speechFixture(88)) == nil {
++		t.Fatal("removed easter egg is still supported")
++	}
++}
++func TestVoiceCuesPersistOnlyCompleteOpus(t *testing.T) {
++	dir := t.TempDir()
++	c, err := OpenVoiceCues(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if c.save(ThinkingPhrase, []byte("not audio")) == nil {
++		t.Fatal("invalid audio cached")
++	}
++	if err = c.save(ThinkingPhrase, speechFixture(77)); err != nil {
++		t.Fatal(err)
++	}
++	c, err = OpenVoiceCues(dir)
++	if err != nil || len(c.load(ThinkingPhrase)) == 0 {
++		t.Fatal("cache did not survive reopen", err)
++	}
++	entries, _ := os.ReadDir(dir)
++	if len(entries) != 1 {
++		t.Fatal("unexpected cache entries", len(entries))
++	}
++	st, _ := os.Stat(filepath.Join(dir, entries[0].Name()))
++	if st.Mode().Perm() != 0600 {
++		t.Fatal("unsafe cache mode")
++	}
++}
++func TestCachedThinkingPrecedesAnswerWithoutSynthesis(t *testing.T) {
++	release := make(chan struct{})
++	n, up, down := soundSession(t, delayedRoute{release})
++	n.VoiceCues = cuesForTest(t)
++	if err := n.Client(t.Context(), websocket.MessageBinary, soundInput("question")); err != nil {
++		t.Fatal(err)
++	}
++	var streamID int64
++	for streamID == 0 {
++		f := nextSoundFrame(t, down)
++		if f.Kind() == "TtsSpeak" {
++			streamID = f.Server.GetEvent().GetHeader().GetStreamId()
++		}
++	}
++	for len(up) > 0 {
++		if f := <-up; f.Kind() == "TtsGenerate" {
++			t.Fatal("cached cue was synthesized again")
++		}
++	}
++	close(release)
++	for {
++		f := nextSoundFrame(t, up)
++		if f.Kind() == "TtsGenerate" {
++			if f.Client.GetEvent().GetTtsGenerate().GetText() != "Готовый ответ" {
++				t.Fatal("unexpected synthesis")
++			}
++			feedSpeech(t, n, f.Client.GetEvent().GetHeader().GetMessageId(), 88, false)
++			break
++		}
++	}
++	for {
++		f := nextSoundFrame(t, down)
++		if f.Kind() == "TtsSpeak" {
++			t.Fatal("second player")
++		}
++		if sc := f.Server.GetStreamControl(); sc != nil && sc.GetClose() != nil {
++			if sc.GetStreamId() != streamID {
++				t.Fatal("second audio stream")
++			}
++			break
++		}
++	}
++}
++func TestMicrophoneRemainsOpenPastTenSecondsWithoutLocalReply(t *testing.T) {
++	n, up, down := soundSession(t, nil)
++	n.VoiceCues = cuesForTest(t)
++	if err := n.Client(t.Context(), websocket.MessageBinary, micInput("long-mic", 23)); err != nil {
++		t.Fatal(err)
++	}
++	if f := nextSoundFrame(t, up); f.Kind() != "VoiceInput" {
++		t.Fatal("missing mic input")
++	}
++	time.Sleep(10100 * time.Millisecond)
++	if len(down) != 0 {
++		t.Fatal("local reply or recording interruption without final ASR")
++	}
++	audio := append(binary.BigEndian.AppendUint32(nil, 23), []byte("still-recording")...)
++	if err := n.Client(t.Context(), websocket.MessageBinary, audio); err != nil {
++		t.Fatal(err)
++	}
++	if f := nextSoundFrame(t, up); string(f.Raw) != string(audio) {
++		t.Fatal("ongoing audio no longer forwarded")
++	}
++	if err := n.Client(t.Context(), websocket.MessageBinary, micClose("long-mic", 23)); err != nil {
++		t.Fatal(err)
++	}
++	if f := nextSoundFrame(t, up); f.Kind() != "StreamControl" {
++		t.Fatal("mic close not forwarded")
++	}
++}
++func TestMicrophoneControlOwnMessageIDIsTransparent(t *testing.T) {
++	for _, fromServer := range []bool{false, true} {
++		for _, spotter := range []bool{false, true} {
++			t.Run(fmt.Sprintf("server=%v/spotter=%v", fromServer, spotter), func(t *testing.T) {
++				n, up, down := soundSession(t, nil)
++				n.VoiceCues = cuesForTest(t)
++				if err := n.Client(t.Context(), websocket.MessageBinary, micInput("voice-request", 23)); err != nil {
++					t.Fatal(err)
++				}
++				_ = nextSoundFrame(t, up)
++				sc := &stream.TStreamControl{MessageId: "independent-control-id", StreamId: 23, Action: &stream.TStreamControl_Close{Close: &stream.TStreamControl_TActionClose{}}}
++				if spotter {
++					sc.Action = &stream.TStreamControl_SpotterEnd{SpotterEnd: &stream.TStreamControl_TActionSpotterEnd{}}
++				}
++				var raw []byte
++				var out chan wire.Frame
++				if fromServer {
++					raw = aa(&server.TServerMessage{Message: &server.TServerMessage_StreamControl{StreamControl: sc}})
++					out = down
++					if err := n.Server(t.Context(), websocket.MessageBinary, raw); err != nil {
++						t.Fatal(err)
++					}
++				} else {
++					raw = aa(&client.TClientMessage{Message: &client.TClientMessage_StreamControl{StreamControl: sc}})
++					out = up
++					if err := n.Client(t.Context(), websocket.MessageBinary, raw); err != nil {
++						t.Fatal(err)
++					}
++				}
++				if len(out) != 1 {
++					t.Fatal("valid control with own message ID was dropped", len(out))
++				}
++				if f := <-out; !bytes.Equal(f.Raw, raw) {
++					t.Fatal("microphone control bytes changed")
++				}
++			})
++		}
++	}
++}
++func TestStaleCloseCannotAffectReusedMic(t *testing.T) {
++	for _, fromServer := range []bool{false, true} {
++		t.Run(map[bool]string{false: "client", true: "server"}[fromServer], func(t *testing.T) {
++			n, up, down := soundSession(t, nil)
++			n.VoiceCues = cuesForTest(t)
++			_ = n.Client(t.Context(), websocket.MessageBinary, micInput("old", 23))
++			_ = n.Client(t.Context(), websocket.MessageBinary, micInput("new", 23))
++			for len(up) > 0 {
++				<-up
++			}
++			if fromServer {
++				_ = n.Server(t.Context(), websocket.MessageBinary, aa(&server.TServerMessage{Message: &server.TServerMessage_StreamControl{StreamControl: &stream.TStreamControl{MessageId: "old", StreamId: 23, Action: &stream.TStreamControl_Close{Close: &stream.TStreamControl_TActionClose{}}}}}))
++			} else {
++				_ = n.Client(t.Context(), websocket.MessageBinary, micClose("old", 23))
++			}
++			if len(up) > 0 || len(down) > 0 {
++				t.Fatal("stale close forwarded")
++			}
++			audio := append(binary.BigEndian.AppendUint32(nil, 23), []byte("current-mic")...)
++			_ = n.Client(t.Context(), websocket.MessageBinary, audio)
++			if f := nextSoundFrame(t, up); string(f.Raw) != string(audio) {
++				t.Fatal("new mic audio blocked")
++			}
++		})
++	}
++}
++func TestCanceledTTSBlocksLateAudio(t *testing.T) {
++	n, up, down := soundSession(t, resolverFunc(func(context.Context, string) (Resolution, error) { return Resolution{Route: "llm", Answer: "old"}, nil }))
++	n.VoiceCues = cuesForTest(t)
++	_ = n.Client(t.Context(), websocket.MessageBinary, soundInput("old"))
++	id := ""
++	for id == "" {
++		f := nextSoundFrame(t, up)
++		if f.Kind() == "TtsGenerate" {
++			id = f.Client.GetEvent().GetHeader().GetMessageId()
++		}
++	}
++	for len(down) > 0 {
++		<-down
++	}
++	_ = n.Client(t.Context(), websocket.MessageBinary, micInput("new", 23))
++	feedSpeech(t, n, id, 77, false)
++	if len(down) > 0 {
++		t.Fatal("canceled TTS leaked downstream audio")
++	}
++}
++func TestConfiguredPersonaPreservesBaseSafety(t *testing.T) {
++	e := &Engine{SystemPrompt: "Едкий русский сленг и мат.", LLM: completionFunc(func(_ context.Context, m []llm.Message, _ bool) (string, error) {
++		if !strings.Contains(m[0].Content, "Едкий русский сленг и мат.") || !strings.Contains(m[0].Content, "Не заявляй о выполнении") {
++			t.Fatal("persona replaced safety or is absent")
++		}
++		return "Готово.", nil
++	})}
++	if _, err := e.Fallback(t.Context(), "тест"); err != nil {
++		t.Fatal(err)
++	}
++}
+--- /dev/null
++++ b/internal/bridge/safety_test.go
+@@ -0,0 +1,58 @@
++package bridge
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"quasarbridge/internal/llm"
++)
++
++func TestQuestionSafetyFailsClosed(t *testing.T) {
++	ctx, cancel := context.WithCancel(t.Context())
++	cancel()
++	for _, tc := range []struct {
++		name     string
++		ctx      context.Context
++		question string
++	}{
++		{"missing_model", t.Context(), "Почему небо голубое?"},
++		{"empty_question", t.Context(), ""},
++		{"canceled", ctx, "Почему небо голубое?"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if safe, err := (&Engine{}).CheckQuestionSafety(tc.ctx, QuestionSafetyInput{Question: tc.question}); safe || err == nil {
++				t.Fatal("missing or invalid safety decision must fail closed")
++			}
++		})
++	}
++}
++
++func TestQuestionSafetyRequiresExplicitDecision(t *testing.T) {
++	for _, tc := range []struct {
++		decision string
++		want     bool
++	}{
++		{`{"safe":true}`, true},
++		{`{"safe":false}`, false},
++		{`{}`, false},
++		{`{"safe":true,"unexpected":true}`, false},
++		{`not JSON`, false},
++	} {
++		t.Run(tc.decision, func(t *testing.T) {
++			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				w.Header().Set("Content-Type", "application/json")
++				// Encode only synthetic classifier text as the real API envelope.
++				json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]string{"role": "assistant", "content": tc.decision}, "finish_reason": "stop"}}})
++			}))
++			defer srv.Close()
++			e := &Engine{LLM: &llm.Client{BaseURL: srv.URL, Model: "synthetic-guard"}}
++			safe, _ := e.CheckQuestionSafety(t.Context(), QuestionSafetyInput{Question: "Почему небо голубое?"})
++			if safe != tc.want {
++				t.Fatalf("safe=%v want=%v", safe, tc.want)
++			}
++		})
++	}
++}

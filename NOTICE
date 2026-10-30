@@ -1,0 +1,17 @@
+Quasar Bridge
+Copyright 2026 Sergey Krashevich and contributors
+
+Licensed under the Apache License, Version 2.0.
+Third-party dependencies retain their own copyright notices and licenses.
+
+Alice Gemini Bridge
+Copyright 2026 vladokan42 and contributors
+Integration kit for original Quasar Bridge and OmniRoute releases.
+This tree contains an integration delta patch, not a vendored service source tree.
+Quasar Bridge is downloaded from skrashevich/quasar-bridge and modified at build
+with native acknowledgement cache, configurable persona and microphone fixes.
+Original LICENSE, NOTICE and THIRD_PARTY_NOTICES accompany the downloaded build.
+OmniRoute is downloaded from the original project's published Docker namespace,
+without source modification; it retains its own license and notices.
+Also includes routing examples, server/device installation and embedded recovery.
+Modified source files carry notices; see docs/PROVENANCE.md.

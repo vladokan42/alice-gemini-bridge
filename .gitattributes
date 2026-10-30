@@ -1,0 +1,3 @@
+# Patch context necessarily prefixes tabs and blank lines with a space.
+# Added Go lines are still checked by git apply --whitespace=error-all.
+patches/*.patch -whitespace

@@ -1,0 +1,32 @@
+# Local configuration and credentials
+config.json
+config.local.json
+runtime.env
+.env
+.env.*
+!runtime.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+private/
+secrets/
+.credentials/
+certs/
+# Generated state, captures and binaries
+bin/
+dist/
+.cache/
+.upstream/
+*.log
+*.jsonl
+*.sqlite*
+*.db*
+*.ogg
+*.opus
+*.wav
+*.pcm
+*.pcap*
+__pycache__/
+*.pyc
+.DS_Store

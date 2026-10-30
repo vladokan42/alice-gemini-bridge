@@ -1,0 +1,120 @@
+#!/bin/sh
+# Embedded network helper: start only after preflight; stock firmware stays intact.
+set -eu
+umask 077
+state=$(readlink -f "${QUASAR_DATA_DIR:-/data/opt/quasar-bridge}")
+target=$(readlink -f "${QUASAR_DEVICE_CONFIG:-/system/vendor/quasar/quasar.cfg}")
+mountinfo=${QUASAR_MOUNTINFO:-/proc/self/mountinfo}
+pidfile=${QUASAR_PIDFILE:-/var/run/quasar-bridge-supervisor.pid}
+export QUASAR_DATA_DIR="$state" QUASAR_DEVICE_CONFIG="$target" QUASAR_MOUNTINFO="$mountinfo"
+inspect() {
+    count=0
+    observed=
+    while IFS= read -r row; do
+        set -f
+        set -- $row
+        test "$#" -ge 6 || continue
+        if test "$5" = "$target"; then
+            count=$((count + 1))
+            observed=$row
+        fi
+    done < "$mountinfo"
+}
+health() { wget -T 2 -q -O /dev/null http://127.0.0.1:18861/healthz; }
+stop_processes() {
+    start-stop-daemon -K -q -o -x "$state/bin/quasar-bridge" || true
+    if test -r "$pidfile"; then
+        IFS= read -r p < "$pidfile"
+        case "$p" in *[!0-9]*|'') return 1;; esac
+        if test -r "/proc/$p/cmdline"; then
+            if grep -q -F "$state/supervise.sh" "/proc/$p/cmdline"; then
+                start-stop-daemon -K -q -o -p "$pidfile" -x /bin/sh || true
+            fi
+        fi
+    fi
+    rm -f "$pidfile"
+}
+start() {
+    # First-install deadline is independent of the SSH session and bridge health.
+    if test -f "$state/acceptance.pending"; then
+        test -r "$state/recovery.sh"
+        # A generic /bin/sh match without -p matches unrelated shells and never starts.
+        # Reused PIDs from a prior boot must not suppress the independent deadline.
+        recovery_running=0
+        if test -r "$state/recovery.pid"; then
+            IFS= read -r p < "$state/recovery.pid" || p=
+            case "$p" in
+                *[!0-9]*|'') :;;
+                *) if test -r "/proc/$p/cmdline" && grep -q -F "$state/recovery.sh" "/proc/$p/cmdline"; then recovery_running=1; fi;;
+            esac
+        fi
+        if test "$recovery_running" = 0; then
+            rm -f "$state/recovery.pid"
+            start-stop-daemon -S -b -m -p "$state/recovery.pid" -x /bin/sh -- "$state/recovery.sh"
+        fi
+    fi
+    if test -f "$state/disabled"; then return 0; fi
+    test -x "$state/bin/quasar-bridge"
+    test -r "$state/start.sh"
+    test -r "$state/supervise.sh"
+    test -r "$state/runtime.env"
+    test -r "$state/config.json"
+    test -r "$state/original.cfg"
+    test -r "$state/candidate.cfg"
+    inspect
+    active=0
+    if test "$count" = 0; then
+        cmp -s "$target" "$state/original.cfg" || return 1
+    elif test "$count" = 1; then
+        test -f "$state/mount.record" || return 1
+        IFS= read -r expected < "$state/mount.record"
+        test "$observed" = "$expected" || return 1
+        cmp -s "$target" "$state/candidate.cfg" || return 1
+        active=1
+        if health; then return 0; fi
+    else
+        return 1
+    fi
+    start-stop-daemon -S -b -m -p "$pidfile" -x /bin/sh -- "$state/supervise.sh"
+    tries=0
+    until health; do
+        tries=$((tries + 1))
+        if test "$tries" -ge 15; then
+            touch "$state/disabled"
+            if test "$active" = 1; then
+                sh "$state/rollback-bind.sh" "$state" "$target" "$mountinfo"
+            fi
+            stop_processes
+            logger -t quasar-bridge 'startup failed; stock firmware route retained or restored'
+            if test "$active" = 1; then
+                sync
+                reboot
+            fi
+            return 1
+        fi
+        sleep 1
+    done
+    if test "$active" = 1; then return 0; fi
+    mount -o bind "$state/candidate.cfg" "$target"
+    if ! mount -o remount,bind,ro "$target"; then
+        umount "$target"
+        touch "$state/disabled"
+        stop_processes
+        return 1
+    fi
+    inspect
+    test "$count" = 1
+    printf '%s\n' "$observed" > "$state/mount.record"
+    cmp -s "$target" "$state/candidate.cfg"
+    logger -t quasar-bridge 'ready; loopback firmware route active'
+}
+case "${1:-}" in
+    start) start ;;
+    enable) rm -f "$state/disabled"; start ;;
+    stop)
+        touch "$state/disabled"
+        sh "$state/rollback-bind.sh" "$state" "$target" "$mountinfo"
+        stop_processes
+        ;;
+    *) printf '%s\n' 'usage: S98quasarbridge start|enable|stop' >&2; exit 2 ;;
+esac
