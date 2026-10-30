@@ -23,7 +23,7 @@
 выбранного провайдера — CLI-доступ не означает отсутствие ограничений.
 
 Это **комплект интеграции, не копия двух сервисов**. Он скачивает оригинальный
-[Quasar Bridge](https://github.com/skrashevich/quasar-bridge) Сергея Красевича
+[Quasar Bridge](https://github.com/skrashevich/quasar-bridge) Сергея Крашевича
 и применяет наши изменения отдельным патчем. Авторство и Apache-2.0 сохранены:
 [происхождение](docs/PROVENANCE.md) · [LICENSE](LICENSE) · [NOTICE](NOTICE).
 Не связан с Яндексом и Google.
